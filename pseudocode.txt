@@ -1,0 +1,69 @@
+clustering 得到clusters
+生成gbs
+aco规划gbs之间的路径；
+aco依次规划gb内的路径；
+
+for iter in Max_iter:
+    跨cluster局部搜索；
+    评估；
+    更新最优解；
+
+    if gbs发生显著偏移：
+        重新生成new_gbs
+        aco规划gbs之间的路径；
+        aco依次规划gb内的路径；
+    else
+        之前的gbs
+        
+        
+        
+        
+
+# 初始化
+clusters ← initial clusters
+for cid in clusters:
+    gbs_dict[cid] ← build_gbs(clusters[cid])        # GbDbscanCluster.fit()
+    gbs_route[cid] ← aco_plan_gbs(gbs_dict[cid])    # GbPlanning.run()
+    routes_by_cluster[cid] ← aco_plan_inside(gbs_dict[cid], gbs_route[cid])  # CustomersPlanning.run()
+flat_routes ← flatten(routes_by_cluster)
+best ← evaluate_and_decode(flat_routes)             # Decoder + calculate_cost
+
+# 外层迭代
+no_improve_rounds ← 0
+for iter in 1..Max_iter:
+    flat_routes', affected ← cross_cluster_LS(flat_routes)     # 不解码
+    
+    if not surrogate_better(flat_routes', flat_routes):        # 可选 gate
+        if early_stop(): break
+        continue
+
+    cand ← evaluate_and_decode(flat_routes')
+    if cand.cost < best.cost:
+        best ← cand
+        flat_routes ← flat_routes'
+        no_improve_rounds ← 0
+    else:
+        no_improve_rounds += 1
+
+    REBUILD_SET ← detect_gbs_shift(affected, GBS_CACHE, flat_routes)
+    if REBUILD_SET not empty:
+        for cid in REBUILD_SET:
+            gbs_dict[cid] ← rebuild_gbs(flat_routes[cid])      # GbDbscanCluster.fit()
+            (maybe) gbs_route[cid] ← aco_plan_gbs(...)
+            routes_by_cluster[cid] ← aco_plan_inside(...)
+            flat_routes[cid] ← flatten(routes_by_cluster[cid])
+
+    if no_improve_rounds ≥ patience or time_limit hit: break
+
+
+
+
+
+
+    
+
+
+
+
+
+
