@@ -40,7 +40,7 @@ class ACOParams:
 
 # ===== Ant 蚂蚁类 =====
 class Ant:
-    def __init__(self, total_nodes_list, pheromone_matrix, heuristic_matrix):
+    def __init__(self, total_nodes_list, pheromone_matrix, heuristic_matrix, aco=None):
         """
         构建每个蚂蚁的路径（基于 customer节点）
         :param total_nodes_list: 所有客户节点编号
@@ -50,6 +50,7 @@ class Ant:
         self.total_nodes_list = list(total_nodes_list)
         self.pheromone_matrix = pheromone_matrix
         self.heuristic_matrix = heuristic_matrix
+        self.aco = aco
 
         start_node = np.random.choice(self.total_nodes_list)
         self.ant_route = [start_node]
@@ -96,10 +97,16 @@ class Ant:
         return next_node
 
     def move_to(self, next_node):
+        prev = self.current_node  # 👈 先保存上一点
+
         self.ant_route.append(next_node)
         self.taboo_set.add(next_node)
         self.unvisited.remove(next_node)
         self.current_node = next_node
+
+        # ✅ 局部信息素更新：每走一步就更新刚走过的边
+        if self.aco is not None:
+            self.aco.local_update(prev, next_node)
 
     def construct_solution(self, alpha=1, beta=2):
         while self.unvisited:
@@ -161,6 +168,27 @@ class AntColonyOptimizer:
         np.fill_diagonal(self.heuristic_matrix, 0.0)
         np.fill_diagonal(self.pheromone_matrix, 0.0)
 
+        # 记录全局最优解
+        self.best_cost_ant = None
+        self.best_cost = float('inf')
+
+        self.best_ra_ant = None
+        self.best_ra = float('inf')
+
+
+
+    def local_update(self, i, j):
+        # 一个常见的局部更新形式：挥发 + 少量常数补偿
+        # 你也可以用 1/d(i,j) 做补偿，下面给两种写法任选其一
+
+        # 写法 A（更像 ACS）：tau = (1-rho)*tau + rho*tau0
+        tau0 = 1.0
+        self.pheromone_matrix[i, j] = (1 - self.rho) * self.pheromone_matrix[i, j] + self.rho * tau0
+
+        # 写法 B（更贴你现在的风格）：tau = (1-rho)*tau + 1/d
+        # self.pheromone_matrix[i, j] = (1 - self.rho) * self.pheromone_matrix[i, j] \
+        #                               + 1.0 / (self.customer_distance_matrix[i, j] + 1e-6)
+
 
     def _insert_depot(self, ant_route_global):
         if self.para_depot is None:
@@ -217,10 +245,7 @@ class AntColonyOptimizer:
 
         start_state = copy.deepcopy(self.state0)
         end_state = self.decoder.simulate_within_GB(inserted_last_cus_route, start_state)
-
-        total_ra = end_state.get("total_ra", 0.0)
-        total_route_cost = end_state.get("total_route_cost", 0.0)
-
+    
         if self.next_gb_center is not None:
             last_node = end_state["last_node"]
             total_ra, total_route_cost = self.decoder.simulate_to_gbCenter(
@@ -231,7 +256,7 @@ class AntColonyOptimizer:
 
         return total_ra, total_route_cost, end_state
     
-    def update_pheromones(self, ant_population, elite_ant, objective_fn):
+    def update_pheromones(self, ant_population, elite_ant):
         """
         信息素更新：蒸发 + 普通蚂蚁贡献 + 精英蚂蚁贡献强化
         注意：此处为非闭合路径，首尾之间信息素没有更新
@@ -239,25 +264,24 @@ class AntColonyOptimizer:
         
         # 普通蚂蚁贡献
         delta_tau = np.zeros_like(self.pheromone_matrix)
-
         for ant in ant_population:
             route = ant.ant_route
-            val = objective_fn(ant)
-            if val <= 0:
+            cost = ant.cost
+            if cost <= 0:
                 continue
             for i in range(len(route) - 1):
                 n1, n2 = route[i], route[i+1]
-                delta_tau[n1, n2] += 1 / (val + 1e-6)
+                delta_tau[n1, n2] += 1 / cost
 
         # 精英蚂蚁贡献强化
         elite_delta_tau = np.zeros_like(self.pheromone_matrix)
         elite_route = elite_ant.ant_route
-        elite_val = objective_fn(elite_ant)
-        if elite_val <= 0:
-            elite_val = 1e-6
+        elite_cost = elite_ant.cost
+        if elite_cost <= 0:
+            elite_cost = 1e-6
         for i in range(len(elite_route) - 1):
             n1, n2 = elite_route[i], elite_route[i+1]
-            elite_delta_tau[n1, n2] += 1 / (elite_val + 1e-6)
+            elite_delta_tau[n1, n2] += 1 / elite_cost  # 这里改成 elite_cost
 
         # 信息素更新
         # 蒸发 + 普通蚂蚁贡献 + 精英蚂蚁贡献强化
@@ -265,23 +289,50 @@ class AntColonyOptimizer:
                             + delta_tau \
                             + self.epsilon * elite_delta_tau
 
-        
-    def run(self, objective_name):
-        '''
-        :param objective: "COST"; "RA"; "SA"
-        '''
-        fitness_list = []
+    def _deposit_elite(self, elite_ant, mode="cost"):
+        route = elite_ant.ant_route
+        f = elite_ant.cost
+        ra = elite_ant.ra
 
-        # 记录全局最优解
-        self.best_ant = None
-        self.best_ant_val = float('inf')
-        self.best_ant_state = None
+        # 把 ra 转成 “越大越好”的 u（类似论文的满意度 u）
+        # 因为你的 ra 是焦虑（越小越好），所以用 1/(ra+eps) 当作 u
+        u = 1.0 / (ra + 1e-6)
 
-        # ✅ 在 run 内部定义 objective_fn（后面 min 和 update 都用它）
-        if objective_name == "COST":
-            objective_fn = lambda ant: ant.cost
-        elif objective_name == "RA":
-            objective_fn = lambda ant: ant.ra
+        # 论文有类似 u/f 的思想：满意度越高、成本越低，强化越大
+        bonus = self.epsilon * (u / (f + 1e-6))
+
+        for i in range(len(route) - 1):
+            n1, n2 = route[i], route[i+1]
+            self.pheromone_matrix[n1, n2] += bonus
+
+    def update_pheromones_dual_elite(self, ant_population, best_cost_ant, best_ra_ant):
+        # 1) 蒸发
+        self.pheromone_matrix *= (1 - self.rho)
+
+        # 2) 普通蚂蚁贡献（你原来的逻辑保留）
+        for ant in ant_population:
+            route = ant.ant_route
+            cost = ant.cost
+            if cost <= 0 or not np.isfinite(cost):
+                continue
+            for i in range(len(route) - 1):
+                n1, n2 = route[i], route[i+1]
+                self.pheromone_matrix[n1, n2] += 1.0 / (cost + 1e-6)
+
+        # 3) cost 精英额外强化
+        self._deposit_elite(best_cost_ant, mode="cost")
+
+        # 4) ra 精英额外强化
+        self._deposit_elite(best_ra_ant, mode="ra")
+
+
+    def run(self):
+        fitness_ra_list = []
+        fitness_cost_list = []
+
+        # ===== 最优解容器：把 route + ra + cost + end_state 绑在一起，避免错配 =====
+        best_cost_sol = None  # dict: {'ra':..., 'cost':..., 'end_state':...}
+        best_ra_sol = None
 
         for gen in range(self.num_iter):
             ant_population = []
@@ -289,34 +340,42 @@ class AntColonyOptimizer:
             for _ in range(self.num_ants):
                 ant = Ant(self.customer_ids_local,
                           self.pheromone_matrix,
-                          self.heuristic_matrix)
+                          self.heuristic_matrix,
+                          aco=self)
                 ant.construct_solution(self.alpha, self.beta)
                 ant_population.append(ant)
 
                 # 更新全局最优
                 ant.ra, ant.cost, end_state = self.evaluate(ant.ant_route)
 
-                val = objective_fn(ant)
-                if val < self.best_ant_val:
-                    self.best_ant = ant
-                    self.best_ant_val = val
-                    self.best_ant_state = end_state
+                sol = {
+                    "ra": ant.ra,
+                    "cost": ant.cost,
+                    "end_state": end_state,   # 下一 GB 要用：last_node、t、Q、load...
+                }
 
+                # cost 最优
+                if (best_cost_sol is None) or (sol["cost"] < best_cost_sol["cost"]):
+                    best_cost_sol = sol
 
-            # 选当代精英（按目标最小）
-            elite_ant = min(ant_population, key=lambda a: float(objective_fn(a)))
-            self.update_pheromones(ant_population, elite_ant, objective_fn)
+                # ra 最优（ra 越小越好）
+                if (best_ra_sol is None) or (sol["ra"] < best_ra_sol["ra"]):
+                    best_ra_sol = sol
 
-            fitness_list.append(self.best_ant_val)
+            # 双目标信息素更新
+            best_cost_ant = min(ant_population, key=lambda a: a.cost)
+            best_ra_ant   = min(ant_population, key=lambda a: a.ra)   # ra 越小越好（焦虑）
+            self.update_pheromones_dual_elite(ant_population, best_cost_ant, best_ra_ant)
 
-        best_sol = {
-            "obj": self.best_ant_val,
-            "ra": self.best_ant.ra,
-            "cost": self.best_ant.cost,
-            "end_state": self.best_ant_state,
-        }
+            # 单目标信息素更新
+            # elite_ant = self.best_ant
+            # self.update_pheromones(ant_population, elite_ant)
 
-        return best_sol, fitness_list
+            # 记录最优适应度和代价
+            fitness_cost_list.append(best_cost_sol["cost"])
+            fitness_ra_list.append(best_cost_sol["ra"])
+
+        return best_cost_sol, best_ra_sol, fitness_cost_list, fitness_ra_list
 
 
 class CustomersPlanning:
@@ -336,10 +395,10 @@ class CustomersPlanning:
                                       state=self.state, 
                                       decoder=self.decoder,
                                       **aca_params)
-   
-    def run(self, objective_name):
-        best_sol, fitness_list = self.aco.run(objective_name)
-        return best_sol, fitness_list
+
+    def run(self):
+        best_cost_sol, best_ra_sol, fitness_cost_list, fitness_ra_list  = self.aco.run()
+        return best_cost_sol, best_ra_sol, fitness_cost_list, fitness_ra_list
 
 
 

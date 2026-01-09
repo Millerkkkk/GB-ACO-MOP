@@ -9,8 +9,17 @@
 
 
 
+import copy
+from dataclasses import dataclass
 import numpy as np
 from collections import namedtuple
+
+@dataclass
+class CostParams:
+    c1: float = 120.0    # fixed dispatch cost
+    c2: float = 0.5    # travel cost per minute
+    c3: float = 0.3    # service cost per minute
+    c4: float = 0.6    # charging cost per minute
 
 
 
@@ -128,7 +137,7 @@ class EnergyModel:
 # Decoder 解码器 (把ant_route 解码为插入cs后的完整route)
 # =========================
 class Decoder:
-    def __init__(self, all_nodes, dist_matrix, energy_model, cs_ids, 
+    def __init__(self, all_nodes, dist_matrix, energy_model, cs_ids, customer_ids,
                  ra_model, ra_safe, ra_risk, 
                  Q_max=40, margin_energy=0.5, radius_km=3.0):
         
@@ -136,6 +145,7 @@ class Decoder:
         self.dist_matrix = dist_matrix
         self.energy_model = energy_model
         self.cs_ids = cs_ids
+        self.customer_ids = customer_ids
         self.Q_max = Q_max
         self.margin_energy = margin_energy
         self.radius_km = radius_km
@@ -817,7 +827,7 @@ class Decoder:
                 Qtr_after = Qtr_before + energy_needed
 
                 seg_ra = self.ra_model.SUMR(Qtr_after, Ttr0, hour0) - self.ra_model.SUMR(Qtr_before, Ttr0, hour0)
-                total_ra += seg_ra
+                gb_ra += seg_ra
 
             # 2) 走这段路
             arrival_time = departure_time + travel_time
@@ -866,6 +876,447 @@ class Decoder:
             total_charging_time, total_service_time,
             num_charge, Q, departure_time, load, total_ra
         )
+
+
+
+
+    def simulate_within_GB(self, init_route, state):
+        """
+        GB 内串行模拟（一步回滚插桩版）
+        - 不计算 cost，只推进：Q / t / load / RA / 充电次数 / 各类时间与距离统计
+        - 允许插入 CS（充电站）以保证可行性
+        - 关键：如果“到达 curr 后才发现不可行”，会回滚到 prev 的快照，再在 prev 后插入 prev 最近 CS，重新开始
+
+        规则（每条边 prev->curr）：
+        1) prev 处保存快照 snap_prev（用于回滚）
+        2) 若 prev->curr 不可达：直接在 prev 后插 cs_prev（无需回滚，因为未推进）
+        3) 若可达：推进到 curr（更新状态）
+        4) 推进后做“后验可行性检查”：
+            - 若 curr 处不可继续（例如 curr 到不了任何 CS，且后续还需要继续走），则回滚到 prev 快照，
+            并在 prev 后插 cs_prev，重新尝试
+        5) 若可行：i += 1
+
+        参数：
+        route: list[int]  节点序列（可含 depot/cs/customer/prev_last）
+        state: dict       串行状态（不会原地修改，会 deepcopy）
+
+        返回：
+        end_state: dict   终止状态（累计）
+        breakdown: dict   本 GB 增量信息（时间/次数/RA等 + final_route）
+        """
+
+        # ------------------- helpers -------------------
+        def _is_customer(node_id):
+            return node_id in self.customer_ids
+
+        def _penalty_exit(cur_idx):
+            # 返回“不可行”state + 大惩罚RA（用于淘汰）
+            end_state = copy.deepcopy(st0)
+
+            end_state["last_node"] = route[max(0, cur_idx - 1)] if route else end_state.get("last_node")
+
+            end_state["total_ra"] = BIG_PENALTY
+            end_state["total_route_cost"] = BIG_PENALTY
+            end_state["total_distance"] = BIG_PENALTY
+            
+            # 把 GB 增量字段也塞进去（统一放 state）
+            end_state["total_dispatch_cost"] = BIG_PENALTY
+            end_state["total_travel_cost"] = BIG_PENALTY
+            end_state["total_service_cost"] = BIG_PENALTY
+            end_state["total_charging_cost"] = BIG_PENALTY
+            end_state["num_charges"] = BIG_PENALTY
+            end_state["energy_charged"] = BIG_PENALTY  
+            return end_state
+
+        # ------------------- init -------------------
+        st0 = copy.deepcopy(state)
+        route = copy.deepcopy(init_route)
+
+        EPS = getattr(self, "EPS", 1e-9)
+        BIG_PENALTY = 1e6
+        WATCHDOG_LIMIT = 5000  # 防止插桩来回卡死（一步回退一般不会，但仍建议保留）
+
+        # 关于 输入状态（上个GB）中的信息
+        Q = st0["Q"]
+        load = st0["load"]
+        t = st0["t"]
+
+        st0.setdefault("full_route", [])
+        st0.setdefault("decoded_full_route", [])
+
+        total_ra = st0["total_ra"]
+        total_route_cost = st0["total_route_cost"]
+        total_distance = st0["total_distance"]
+        
+        t_since_charge = st0["t_since_charge"]
+        Q_after_last_charge = st0["Q_after_last_charge"]
+
+        total_dispatch_cost = st0["total_dispatch_cost"]
+        total_travel_cost = st0["total_travel_cost"]
+        total_service_cost = st0["total_service_cost"]
+        total_charging_cost = st0["total_charging_cost"]
+
+        num_charges = st0["num_charges"]
+        energy_charged = st0["energy_charged"]
+
+
+        # 关于本GB中新增的 Cost/RA
+        gb_ra = 0.0
+        gb_dist = 0.0
+        gb_travel_time = 0.0
+        gb_service_time = 0.0
+        gb_charging_time = 0.0
+        
+        # 关于其他
+        gb_num_charge = 0
+        gb_energy_charged = 0.0
+
+        # 其他
+        watchdog = 0
+        # 防止“插了 prev 的 cs 但下一轮又插同一个”无限循环
+        tried_at_prev = set()  # (prev_node, cs_id, next_node) 防止重复同一处插同一cs
+
+        self.cs_in_3km_node = self._build_anchor_cs_map(route)  # {node: nearest_cs}
+
+        # ------------------- main loop -------------------
+        i = 1
+        while i < len(route):
+            watchdog += 1
+            if watchdog > WATCHDOG_LIMIT:
+                return _penalty_exit(i)
+
+            prev_node = route[i - 1]
+            curr_node = route[i]
+
+
+            # ---- 1) prev 处快照（用于回滚）----
+            cs_prev = self._to_nearest_cs(prev_node, Q, t, load)  # (cs_id, dist, energy, time) or None
+            snap_prev = {
+                "i": i-1,
+                "node": prev_node,
+                "Q": Q,
+                "t": t,
+                "load": load,
+                "t_since_charge": t_since_charge,
+                "Q_after_last_charge": Q_after_last_charge,
+                "gb_ra": gb_ra,
+                "gb_dist": gb_dist,
+
+                "gb_travel_time": gb_travel_time,
+                "gb_service_time": gb_service_time,
+                "gb_charging_time": gb_charging_time,
+
+                "gb_num_charge": gb_num_charge,
+                "gb_energy_charged": gb_energy_charged,
+
+                "cs_prev": cs_prev,
+            }
+
+
+            # ---- 2) risk/opportunity ----
+            if getattr(self, "ra_model", None) is not None:
+                Qtr = max(0.0, Q_after_last_charge - Q)
+                Ttr = t_since_charge
+                hour_of_day = (t / 60.0) % 24.0
+                ra_inst = self.ra_model.R_instant(Qtr, Ttr, hour_of_day)
+                mode = self._ra_mode(ra_inst)
+            else:
+                mode = "safe_mode"
+
+            # risk_mode：主动在 prev 后插最近 cs（不推进）
+            if mode == "risk_mode" and cs_prev is not None:
+                cs_id, _, _, _ = cs_prev
+                # 如果当前目标不是这个CS，则在 prev 后插入
+                if curr_node != cs_id:
+                    key = (prev_node, cs_id, curr_node)
+                    if key in tried_at_prev:
+                        return _penalty_exit(i)
+                    tried_at_prev.add(key)
+                    route.insert(i, cs_id)
+                    continue
+                # 若 prev 到不了任何CS，则继续走后面的可达性判断，不行会惩罚退出
+
+            # opportunity_mode：按 anchor 插桩（不推进）
+            if (mode == "opportunity_mode") and (curr_node in self.cs_in_3km_node):
+                cs_id = self.cs_in_3km_node[curr_node]
+                already_before = (route[i - 1] == cs_id)
+                already_after = (i + 1 < len(route) and route[i + 1] == cs_id)
+
+                if (not already_before) and (not already_after):
+                    next_node = route[i + 1] if i + 1 < len(route) else None
+
+                    d_prev_cs = self.dist_matrix[prev_node, cs_id]
+                    d_cs_curr = self.dist_matrix[cs_id, curr_node]
+                    d_prev_curr = self.dist_matrix[prev_node, curr_node]
+                    d_curr_cs = self.dist_matrix[curr_node, cs_id]
+
+                    if next_node is not None:
+                        d_curr_next = self.dist_matrix[curr_node, next_node]
+                        d_cs_next = self.dist_matrix[cs_id, next_node]
+                        insert_before_cost = d_prev_cs + d_cs_curr + d_curr_next
+                        insert_after_cost = d_prev_curr + d_curr_cs + d_cs_next
+                    else:
+                        insert_before_cost = d_prev_cs + d_cs_curr
+                        insert_after_cost = d_prev_curr + d_curr_cs
+
+                    if insert_before_cost + EPS < insert_after_cost:
+                        route.insert(i, cs_id)
+                    else:
+                        route.insert(i + 1, cs_id)
+
+                    # 只插不推进，让下一轮统一推进
+                    continue
+
+
+            # ---------- 3) 可达性检查, 计算 prev->curr 的能耗/时间 ----------
+            # （未推进，不需要回滚）
+            dist = self.dist_matrix[prev_node, curr_node]
+            energy_needed, travel_time, _ = self.energy_model.calculate_one_node_energy_time(
+                dist, t, load
+            )
+
+            if Q + EPS < energy_needed:
+                if cs_prev is None:
+                    return _penalty_exit(i)
+
+                cs_id, _, _, _ = cs_prev 
+
+                # 避免重复插同一个cs导致死循环
+                key = (prev_node, cs_id, curr_node)
+                if key in tried_at_prev:
+                    return _penalty_exit(i)
+                tried_at_prev.add(key)
+
+                if curr_node == cs_id:
+                    # 目标就是这个CS但仍不可达 => 无解
+                    return _penalty_exit(i)
+
+                route.insert(i, cs_id)
+                continue  # 不推进，下一轮处理 prev->cs
+            
+
+            # ---- 4) 推进 prev->curr（开始污染状态）----
+            # 4.1 RA 段增量
+            if getattr(self, "ra_model", None) is not None:
+                Ttr0 = t_since_charge
+                hour0 = (t / 60.0) % 24.0
+                Qtr_before = max(0.0, Q_after_last_charge - Q)
+                Qtr_after = Qtr_before + energy_needed
+                seg_ra = self.ra_model.SUMR(Qtr_after, Ttr0, hour0) - self.ra_model.SUMR(Qtr_before, Ttr0, hour0)
+                gb_ra += seg_ra
+
+            # 4.2 推进物理状态
+            arrival_time = t + travel_time
+            service_time = self.all_nodes[curr_node].service_time
+            t = arrival_time + service_time
+            if _is_customer(curr_node):
+                load -= self.all_nodes[curr_node].demand
+
+            Q = Q - energy_needed
+
+            gb_travel_time += travel_time
+            gb_service_time += service_time
+            gb_dist += dist
+            t_since_charge += travel_time  # 只加行驶时间
+
+            # 4.3 若 curr 是 CS：充电并重置参考点
+            if curr_node in self.cs_ids:
+                required_charge = max(0.0, self.Q_max - Q)
+                if required_charge > 0:
+                    charge_time = self.energy_model.calculate_charging_time(required_charge)
+                    Q = self.Q_max
+                    t += charge_time
+                    gb_charging_time += charge_time
+                    gb_num_charge += 1
+                    gb_energy_charged += required_charge
+
+                t_since_charge = 0.0
+                Q_after_last_charge = Q
+
+
+            # ---- 5) 推进后判断当前节点是否可以到达最近的cs ----
+            # 判断：在 curr 的状态下，是否还能到达任意一个 CS
+            cs_from_curr = self._to_nearest_cs(curr_node, Q, t, load)
+            if cs_from_curr is None:
+                # 5.1 回滚到 prev 快照
+                Q = snap_prev["Q"]
+                t = snap_prev["t"]
+                load = snap_prev["load"]
+
+                t_since_charge = snap_prev["t_since_charge"]
+                Q_after_last_charge = snap_prev["Q_after_last_charge"]
+                gb_ra = snap_prev["gb_ra"]
+                gb_dist = snap_prev["gb_dist"]
+
+                gb_travel_time = snap_prev["gb_travel_time"]
+                gb_service_time = snap_prev["gb_service_time"]
+                gb_charging_time = snap_prev["gb_charging_time"]
+ 
+                gb_num_charge = snap_prev["gb_num_charge"]
+                gb_energy_charged = snap_prev["gb_energy_charged"]
+
+                # 5.2 在 prev 后插 prev 最近 CS
+                if snap_prev["cs_prev"] is None:
+                    return _penalty_exit(i)
+                
+                cs_id, _, _, _ = snap_prev["cs_prev"]
+
+                key = (prev_node, cs_id, curr_node)
+                if key in tried_at_prev:
+                    return _penalty_exit(i)
+                tried_at_prev.add(key)
+
+                if curr_node == cs_id:
+                    return _penalty_exit(i)
+
+                route.insert(i, cs_id)
+                continue
+
+
+            # ---- 6) 成功：确认这一跳，进入下一节点 ----
+            i += 1
+
+
+        costParams = CostParams()
+        gb_route_cost, cost_detail = calculate_cost(0, gb_travel_time, gb_charging_time, 
+                                                 gb_service_time, costParams)
+        
+        # ------------------- finalize -------------------
+        end_state = copy.deepcopy(st0)
+        end_state["last_node"] = route[-1] if route else end_state.get("last_node")
+        end_state["Q"] = Q
+        end_state["load"] = load
+        end_state["t"] = t
+        end_state["full_route"] = init_route
+        end_state["decoded_full_route"] = route
+
+        end_state["total_ra"] = total_ra + gb_ra
+        end_state["total_route_cost"] = total_route_cost + gb_route_cost
+        end_state["total_distance"] = total_distance + gb_dist
+
+        end_state["t_since_charge"] = t_since_charge
+        end_state["Q_after_last_charge"] = Q_after_last_charge
+        
+        end_state["total_dispatch_cost"] = total_dispatch_cost + cost_detail.dispatch_cost
+        end_state["total_travel_cost"] = total_travel_cost + cost_detail.travel_cost
+        end_state["total_service_cost"] = total_service_cost + cost_detail.service_cost
+        end_state["total_charging_cost"] = total_charging_cost + cost_detail.charging_cost
+
+        end_state["num_charges"] = num_charges + gb_num_charge
+        end_state["energy_charged"] = energy_charged + gb_energy_charged
+
+        return end_state
+
+
+    def simulate_to_gbCenter(self, last_node_from_last_gb, next_gb_center, state):
+        """
+        模拟一段“虚拟 leg”：from_node(真实节点) -> to_xy(坐标点，比如 next_gb_center)
+        - 不服务、不扣 demand
+        - 不插桩（默认），只做一次段推进
+        - 返回：end_state（拷贝后的新state） + breakdown(这段的增量)
+
+        allow_cs_insert: 这里建议 False。因为 to_xy 不是节点，插桩会很怪。
+        """
+        st0 = copy.deepcopy(state)
+        EPS = getattr(self, "EPS", 1e-9)
+        BIG_PENALTY = 1e6
+        costParams = CostParams()
+
+        Q = st0["Q"]
+        load = st0["load"]
+        t = st0["t"]
+
+        t_since_charge = st0["t_since_charge"]
+        Q_after_last_charge = st0["Q_after_last_charge"]
+
+        total_ra = st0["total_ra"]
+        total_route_cost = st0["total_route_cost"]
+
+
+        # ---------- 内部小工具：RA 增量（与 simulate_within_GB 同口径） ----------
+        def _ra_cal(energy_used, t_since, Qref, Qnow, t_now):
+            if getattr(self, "ra_model", None) is None:
+                return 0.0
+            hour0 = (t_now / 60.0) % 24.0
+            Qtr_before = max(0.0, Qref - Qnow)
+            Qtr_after = Qtr_before + energy_used
+            return self.ra_model.SUMR(Qtr_after, t_since, hour0) - self.ra_model.SUMR(Qtr_before, t_since, hour0)
+
+
+        # 计算欧氏距离
+        # --- from node -> center (euclid) ---
+        loc_last = np.array(self.all_nodes[last_node_from_last_gb].location(), dtype=float)
+        loc_center = np.array(next_gb_center, dtype=float)
+        dist = float(np.linalg.norm(loc_last - loc_center))
+
+        # 真实能耗/时间
+        energy_needed, travel_time, _ = self.energy_model.calculate_one_node_energy_time(dist, t, load)
+
+        # ========== A) 直达可行：直接走 ==========
+        if Q + EPS >= energy_needed:
+            ra = _ra_cal(energy_needed, t_since_charge, Q_after_last_charge, Q, t)
+
+            route_cost, cost_detail = calculate_cost(0, travel_time, 0, 0, costParams)
+
+            total_ra += ra
+            total_route_cost += route_cost
+
+            return total_ra, total_route_cost
+        
+
+        # ========== B) 直达不可行：去最近可达 CS 充电，再走 ==========
+        cs_prev = self._to_nearest_cs(last_node_from_last_gb, Q, t, load)  # (cs_id, dist, energy, time) or None
+        if cs_prev is None:
+            # from_node 本身到不了任何 CS，那就无解
+            total_ra += BIG_PENALTY
+            total_route_cost += BIG_PENALTY
+            return total_ra, total_route_cost
+
+        cs_id, dist_to_cs, e_to_cs, tt_to_cs = cs_prev
+
+        # from -> cs 必须可达（_to_nearest_cs 按理已保证，但再保险）
+        if Q + EPS < e_to_cs:
+            total_ra += BIG_PENALTY
+            total_route_cost += BIG_PENALTY
+            return total_ra, total_route_cost
+        
+        # 1) 走到 CS
+        ra_to_cs = _ra_cal(e_to_cs, t_since_charge, Q_after_last_charge, Q, t)
+        Q_cs = Q - e_to_cs
+        t_cs_arrive = t + tt_to_cs
+
+        # 充满电
+        required = max(0.0, self.Q_max - Q_cs)
+        charge_time = self.energy_model.calculate_charging_time(required)
+        Q_after_charge = self.Q_max
+        t_after_charge = t_cs_arrive + charge_time
+
+
+        # 充电后：RA 参考点重置
+        t_since_after = 0.0
+        Q_ref_after = Q_after_charge
+
+        # 2) 从 CS 走到 center
+        cs_xy = np.array(self.all_nodes[cs_id].location(), dtype=float)
+        dist_cs_to_xy = float(np.linalg.norm(cs_xy - loc_center))
+        e2, tt2, _ = self.energy_model.calculate_one_node_energy_time(dist_cs_to_xy, t_after_charge, load)
+
+        if Q_after_charge + EPS < e2:
+            # 即使充满也到不了 to_xy（极端：太远）
+            total_ra += BIG_PENALTY
+            total_route_cost += BIG_PENALTY
+            return total_ra, total_route_cost
+        
+        ra_to_center = _ra_cal(e2, t_since_after, Q_ref_after, Q_after_charge, t_after_charge)
+        
+
+        route_cost, _ = calculate_cost(0, tt_to_cs + tt2, charge_time, 0.0, costParams)
+
+
+
+        return total_ra + ra_to_cs + ra_to_center, total_route_cost + route_cost
+
+
 
 
 

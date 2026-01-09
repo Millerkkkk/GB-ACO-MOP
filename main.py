@@ -101,7 +101,7 @@ class GBACOPlanner:
 
         self.energy_model = EnergyModel()
         self.ra_model = RangeAnxietyModel(self.soc_max)
-        self.decoder = Decoder(self.instance.nodes, self.instance.distance_matrix, self.energy_model, self.instance.cs_ids, 
+        self.decoder = Decoder(self.instance.nodes, self.instance.distance_matrix, self.energy_model, self.instance.cs_ids, self.instance.customer_ids,
                                self.ra_model, self.ra_safe, self.ra_risk, self.soc_max, margin_energy=0.2, radius_km=3.0)
         self.localSearch = LocalSearch(self.instance.nodes, self.instance.distance_matrix, self.instance.depot_ids, self.removal_ratio, loc_penalty=0.1)
 
@@ -150,23 +150,62 @@ class GBACOPlanner:
         return gbs_route
     
     def _plan_internal_gbs_order(self, gbs_info_list, gbs_route):
+        total_demand_all_gbs = sum(
+            self.instance.nodes[cus_id].demand
+            for gb_info in gbs_info_list
+            for cus_id in gb_info["gbs"]
+        )
+        
         # Step 1: 调整 gbs 顺序
         gbs_info_list = [gbs_info_list[i] for i in gbs_route]
-
+        
         if len(gbs_info_list) == 0:
-            return []
+            return [], gbs_info_list
 
         routes = []
-        # Step 2: 逐个 GB 内部路径规划
-        for i in range(len(gbs_info_list)):
-            current_gb = gbs_info_list[i]["gbs"]
 
+        # === 0) 初始化串行 state（只做一次）===
+        # 起点 depot：建议选离第一个GB中心最近的 depot（比 depot_ids[0] 更合理）
+
+        state = {
+            # ---------- 车辆 状态 ----------
+            "last_node": None,
+            "Q": self.decoder.Q_max,   
+            "load": total_demand_all_gbs, 
+            "t": 0.0,
+            "full_route": [],
+            "decoded_full_route": [],
+
+            # ---------- 总目标函数值 ----------
+            "total_ra": 0.0,
+            "total_route_cost": 0.0,
+            "total_distance": 0.0,
+
+            # ---------- RA 状态 ----------
+            "t_since_charge": 0.0,
+            "Q_after_last_charge": self.decoder.Q_max,
+            
+            # ---------- Cost 状态 ----------
+            "total_dispatch_cost": 0.0,
+            "total_travel_cost": 0.0,
+            "total_service_cost": 0.0,
+            "total_charging_cost": 0.0,
+            # "total_wait_cost": 0.0,
+            # "total_delay_cost": 0.0,
+
+            # ---------- charging stats ----------
+            "num_charges": 0,
+            "energy_charged": 0.0,
+        }
+
+         # === 1) 逐 GB 串行规划 (内部路径规划) === 
+        for i, gb_info in enumerate(gbs_info_list):
+            current_gb = gb_info["gbs"]
             if len(current_gb) == 0:
-                continue  # 跳过空 GB（可选）
-
+                continue
             if len(gbs_info_list) == 1:
                 para_depot = 'depart & return'
-                prev_last = None
+                prev_last = state["last_node"]
                 next_center = None
             elif i == 0:
                 para_depot = 'depart'
@@ -174,20 +213,24 @@ class GBACOPlanner:
                 next_center = gbs_info_list[i + 1]["center"]
             elif i == len(gbs_info_list) - 1:
                 para_depot = 'return'
-                prev_last = routes[-1][-1]
+                prev_last = state["last_node"]
                 next_center = None
             else:
                 para_depot = None
-                prev_last = routes[-1][-1]
+                prev_last = state["last_node"]
                 next_center = gbs_info_list[i + 1]["center"]
 
             solver = CustomersPlanning(
-                self.instance, current_gb, para_depot, prev_last,
-                next_center, aca_customer_params
+                self.instance, current_gb, 
+                para_depot, prev_last, next_center, 
+                state, self.decoder, 
+                aca_customer_params
             )
-            best_route, _, _ = solver.run()
+            # print('current_gb', current_gb)
+            best_sol, fitness_list = solver.run('COST')
+            best_route = best_sol['end_state']["decoded_full_route"]
             routes.append(best_route)
-
+        print('routes', routes)
         # 把每个 route[i] 赋值回 gbs_info_list[i]["gbs"]
         for i in range(len(routes)):
             gbs_info_list[i]["gbs"] = routes[i]
@@ -525,14 +568,30 @@ class GBACOPlanner:
         history_points = []
 
         # ========== 初始化：用你原始 pipeline 生成一个可行工作解 ==========
+        begin = time.time()
         routes_by_clusters = {}
         for cid, cluster in self.instance_clusters.items():
             gbs_dict = self._generate_gbs(cluster)
             gb_seq = self._plan_gbs_order(gbs_dict)
             routes, _ = self._plan_internal_gbs_order(gbs_dict, gb_seq)
             routes_by_clusters[cid] = routes
+        end = time.time()
+        print(end - begin)
 
+        # print('routes_by_clusters', routes_by_clusters)
         flat_routes = {cid: [n for r in routes for n in r] for cid, routes in routes_by_clusters.items()}
+        print("flat_routes", flat_routes)
+
+        coordinates = [node.location() for node in instance.nodes]
+
+        plot_routes(
+            coordinates=coordinates,
+            routes=list(flat_routes.values()),
+            depot_list=instance.depot_ids,
+            cs_list=instance.cs_ids,
+            customer_list=instance.customer_ids,
+            title=f"Best Routes of {instance_name}"
+        )
 
         # 初始化也评估一次，放进 archive（否则 archive 可能一开始为空）
         init_cand = self._evaluate_clusters(flat_routes)
@@ -629,12 +688,12 @@ class GBACOPlanner:
  
 if __name__ == '__main__':
     # # ========== 参数设置 ==========
-    instance_name = 'pr06_evrp'
-    base_path = r"D:\02_Research\DataSet\C-mdvrptw-improved"
+    # instance_name = 'pr06_evrp'
+    # base_path = r"D:\02_Research\DataSet\C-mdvrptw-improved"
     
 
-    # instance_name = 'r103_21'
-    # base_path = r"D:\02_Research\DataSet\evrptw_instances_LijunFan\large_instances(100customer21cs_10)"
+    instance_name = 'r103_21'
+    base_path = r"D:\02_Research\DataSet\evrptw_instances_LijunFan\large_instances(100customer21cs_10)"
 
     file_path = os.path.join(base_path, f"{instance_name}.txt")
 
